@@ -111,7 +111,7 @@ summarize_trace() {
   echo "| S3 API Call | Count | Total Bytes (RX) | Total Bytes (TX) |"
   echo "|---|---|---|---|"
   jq -r '
-    select(.api != null) |
+    select(.api != null and .client != "[::1]") |
     [.api, (.callStats.rx // 0), (.callStats.tx // 0)] | @tsv
   ' "$trace_file" 2>/dev/null \
     | sort \
@@ -125,7 +125,7 @@ summarize_trace() {
     | sort -t'|' -k3 -rn
   echo ""
   local total
-  total=$(jq -s '[.[] | select(.api != null)] | length' "$trace_file" 2>/dev/null || echo 0)
+  total=$(jq -r '[.[] | select(.api != null and .client != "[::1]")] | length' "$trace_file" 2>/dev/null || echo 0)
   echo "**Total S3 calls: ${total}**"
   echo ""
 }

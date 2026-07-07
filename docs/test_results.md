@@ -19,7 +19,7 @@
 | Browse Assets | 0 | — |
 | Search by keyword | 0 | — |
 | Delete Component | 0 | DB-only soft-delete |
-| Delete + Cleanup + Compact | 17 | See analysis below |
+| Delete + Cleanup + Compact | 11 | See analysis below |
 
 ## Analysis
 
@@ -69,26 +69,26 @@ Once cached, re-fetching the same artifact produces only **1 GetObject** — Nex
 
 Browsing components, browsing assets, and keyword search produce **zero S3 calls**. These operations are served entirely from the Nexus database (H2/PostgreSQL), confirming that S3 is not on the hot path for metadata queries.
 
-### Delete + Cleanup + Compact (17 S3 calls for 1 component)
+### Delete + Cleanup + Compact (11 S3 calls for 1 component)
 
-Deleting a component and running the full cleanup cycle produces **17 S3 calls** across three phases:
+Deleting a component and running the full cleanup cycle produces **11 S3 calls** across three phases:
 
 **Phase 1 — Delete component (0 S3 calls):**
 Nexus removes the database references but leaves the S3 objects orphaned. Object count stays the same (53).
 
-**Phase 2 — assetBlob.cleanup (2 PutObject, some GetObject):**
-The cleanup task scans the database for orphaned blob references and moves them to `SoftDeletedBlobIndex`. It writes updated `.properties` files marking blobs as soft-deleted. Object count increased by 1 (53→54) due to a copied soft-deleted attributes file.
+**Phase 2 — assetBlob.cleanup (1 GetObject, 2 PutObject):**
+The cleanup task scans the database for orphaned blob references and moves them to `SoftDeletedBlobIndex`. It reads and writes `.properties` files marking blobs as soft-deleted. Object count increased by 1 (53→54) due to a copied soft-deleted attributes file.
 
-**Phase 3 — Compact blobstore (DeleteMultipleObjects + DeleteObject, GetObject, ListObjectsV2):**
-The compact task reads `SoftDeletedBlobIndex`, fetches `.properties` to verify deletion metadata, then batch-deletes the S3 objects:
+**Phase 3 — Compact blobstore (1 HeadBucket, 5 GetObject, 1 DeleteMultipleObjects, 1 DeleteObject):**
+The compact task reads blob IDs from `SoftDeletedBlobIndex` (database query — **no S3 LIST**), fetches `.properties` to verify deletion metadata, then batch-deletes the S3 objects:
+- **1 HeadBucket** — bucket check
+- **5 GetObject** — reading properties files for verification
 - **1 DeleteMultipleObjects** — batch removal of `.bytes` + `.properties` pairs
 - **1 DeleteObject** — removal of the soft-deleted attributes copy
-- **6 GetObject** — reading properties files for verification
-- **3 ListObjectsV2** — scanning for related objects under the blob prefix
-- **3 GetBucketLocation** — bucket validation (reconnection overhead)
-- **1 HeadBucket** — bucket check
 
 Objects removed: 3 (54→51), matching the uploaded artifact's `.bytes`, `.properties`, and the soft-delete attributes copy.
+
+**Key finding:** Compact does **not** use ListObjectsV2 to scan the bucket. It reads blob IDs from the `SoftDeletedBlobIndex` database table via `getRecordsBefore()`. This was confirmed by bytecode analysis of `S3BlobStore.doCompactWithDeletedBlobIndex()` and by verifying client IPs in the trace — all ListObjectsV2 calls originated from `[::1]` (the test script's `mc ls`), while Nexus calls came from `172.22.0.3`.
 
 **Test configuration:** Grace period set to 0 via `nexus.assetBlobCleanupTask.blobCreatedDelayMinute=0` and cron disabled via `nexus.assetBlobCleanupTask.cronSchedule=0 0 0 31 12 ?` (Dec 31 only) to allow manual triggering.
 
@@ -107,9 +107,9 @@ Objects removed: 3 (54→51), matching the uploaded artifact's `.bytes`, `.prope
 
 3. **Proxy cache misses are cheap per artifact.** A single cache miss costs ~7 S3 calls, comparable to a direct upload.
 
-4. **No ListObjects on the hot path.** The only ListObjectsV2 observed during normal operations was a one-time blobstore health check on first use of a repository. ListObjectsV2 is used during compaction to scan for related objects.
+4. **No ListObjects at all during normal operations or compact.** The only ListObjectsV2 observed was a one-time blobstore health check on first use of a proxy repository. Compact reads blob IDs from the database (`SoftDeletedBlobIndex`), not from S3 — it does not scan the bucket. ListObjectsV2 would only be used during a `rebuildDeletedBlobIndex` recovery (fallback path via `doCompactWithoutDeletedBlobIndex`).
 
-5. **Deletes are deferred with a grace period.** No S3 cost at delete time. The full delete-to-S3-removal cycle costs ~17 S3 calls per component (cleanup + compact). Default grace period is 60 minutes (`nexus.assetBlobCleanupTask.blobCreatedDelayMinute`), cleanup runs every 30 minutes. S3 TTL/lifecycle rules cannot substitute — compact maintains database consistency and metrics.
+5. **Deletes are deferred with a grace period.** No S3 cost at delete time. The full delete-to-S3-removal cycle costs ~11 S3 calls per component (cleanup + compact). Default grace period is 60 minutes (`nexus.assetBlobCleanupTask.blobCreatedDelayMinute`), cleanup runs every 30 minutes. S3 TTL/lifecycle rules cannot substitute — compact maintains database consistency and metrics.
 
 6. **MinIO compatibility with Nexus 3.93.2 works** with two prerequisites:
    - `nexus.blobstore.s3.ownership.check.disabled=true` (available since 3.89.0)
