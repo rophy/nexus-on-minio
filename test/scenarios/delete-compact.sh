@@ -50,12 +50,76 @@ sleep 3
 stop_trace "${TRACE_DIR}/delete.json"
 summarize_trace "${TRACE_DIR}/delete.json" "Delete Component" | tee "${TRACE_DIR}/delete.md"
 
-# Check MinIO for soft-delete evidence
-echo "Checking MinIO for soft-deleted objects..."
-$DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l | xargs -I{} echo "  Total objects in bucket: {}"
+# Create the compact task via ExtDirect API (REST API POST /v1/tasks returns 405)
+echo "Creating compact blobstore task via ExtDirect API..."
+COMPACT_RESULT=$(curl -sf -u "${NEXUS_USER}:${NEXUS_PASS}" -X POST "${NEXUS_URL}/service/extdirect" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "coreui_Task",
+    "method": "create",
+    "data": [{
+      "typeId": "blobstore.compact",
+      "enabled": true,
+      "name": "Compact minio blobstore (test)",
+      "notificationCondition": "FAILURE",
+      "schedule": "manual",
+      "properties": {
+        "blobstoreName": "minio"
+      }
+    }],
+    "type": "rpc",
+    "tid": 1
+  }' 2>/dev/null)
 
+COMPACT_TASK_ID=$(echo "$COMPACT_RESULT" | jq -r '.result.data.id // empty')
+if [ -z "$COMPACT_TASK_ID" ]; then
+  echo "ERROR: Could not create compact task" >&2
+  echo "$COMPACT_RESULT" | jq .
+  exit 1
+fi
+echo "  Created compact task: ${COMPACT_TASK_ID}"
+
+# Count objects before compact
+BEFORE_COUNT=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
+echo "  Objects before compact: ${BEFORE_COUNT}"
+
+# Run the compact task with trace
+echo "Running compact task..."
+start_trace "${TRACE_DIR}/compact.json"
+
+nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/tasks/${COMPACT_TASK_ID}/run" >/dev/null
+
+# Wait for task to complete
+for i in $(seq 1 30); do
+  STATE=$(nexus_curl "${NEXUS_URL}/service/rest/v1/tasks/${COMPACT_TASK_ID}" 2>/dev/null \
+    | jq -r '.currentState // "UNKNOWN"')
+  [ "$STATE" = "WAITING" ] && break
+  sleep 1
+done
+
+stop_trace "${TRACE_DIR}/compact.json"
+summarize_trace "${TRACE_DIR}/compact.json" "Compact Blobstore" | tee "${TRACE_DIR}/compact.md"
+
+# Count objects after compact
+AFTER_COUNT=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
+echo "  Objects after compact: ${AFTER_COUNT}"
+echo "  Objects removed: $((BEFORE_COUNT - AFTER_COUNT))"
 echo ""
-echo "NOTE: Compact blobstore task cannot be created via REST API in Nexus 3.93.2."
-echo "      It must be created via the admin UI (Administration > System > Tasks)."
+echo "NOTE: Compact may report 0 objects removed because the assetBlob.cleanup"
+echo "      task has a grace period (~24h) before orphaned blobs become eligible"
+echo "      for compaction. The two-stage process is:"
+echo "      1. assetBlob.cleanup (cron) -> moves orphaned blobs to SoftDeletedBlobIndex"
+echo "      2. blobstore.compact (manual) -> issues S3 DeleteObject for indexed blobs"
+
+# Clean up the test task
+curl -sf -u "${NEXUS_USER}:${NEXUS_PASS}" -X POST "${NEXUS_URL}/service/extdirect" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"action\": \"coreui_Task\",
+    \"method\": \"remove\",
+    \"data\": [\"${COMPACT_TASK_ID}\"],
+    \"type\": \"rpc\",
+    \"tid\": 2
+  }" >/dev/null 2>&1 || true
 
 echo "=== Scenario complete ==="
