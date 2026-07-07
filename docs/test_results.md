@@ -74,10 +74,10 @@ Browsing components, browsing assets, and keyword search produce **zero S3 calls
 Deleting a component via the REST API produces **zero S3 calls**. Nexus removes the database references but leaves the S3 objects (`.bytes` + `.properties`) orphaned in the bucket.
 
 The S3 object cleanup is a **two-stage process**:
-1. **`assetBlob.cleanup` task** — runs on a cron schedule per format (e.g., "Cleanup unused raw blobs"). Scans the database for orphaned blob references with a built-in grace period (default ~24 hours). Moves qualifying entries to the `SoftDeletedBlobIndex`.
+1. **`assetBlob.cleanup` task** — runs every 30 minutes per format (e.g., "Cleanup unused raw blobs"). Scans the database for orphaned blob references with a grace period of 60 minutes (`nexus.assetBlobCleanupTask.blobCreatedDelayMinute`, default 60). Moves qualifying entries to the `SoftDeletedBlobIndex`.
 2. **`blobstore.compact` task** — reads the `SoftDeletedBlobIndex` and issues S3 `DeleteObject` calls to remove the actual `.bytes` and `.properties` files.
 
-In our test, both tasks ran successfully but found zero blobs to process — the grace period had not elapsed. The compact task's `blobsOlderThan` parameter (default 0 days) only applies to blobs already in the `SoftDeletedBlobIndex`; it cannot bypass the `assetBlob.cleanup` grace period.
+In our test, both tasks ran successfully but found zero blobs to process — the 60-minute grace period had not elapsed. The compact task's `blobsOlderThan` parameter (default 0 days) only applies to blobs already in the `SoftDeletedBlobIndex`; it cannot bypass the `assetBlob.cleanup` grace period.
 
 **Triggering compact programmatically:** The REST API `POST /v1/tasks` returns 405 (cannot create tasks). However:
 - The **ExtDirect API** (`POST /service/extdirect` with `coreui_Task.create`) can create a compact task with `schedule: "manual"`.
@@ -96,7 +96,7 @@ In our test, both tasks ran successfully but found zero blobs to process — the
 
 4. **No ListObjects on the hot path.** The only ListObjectsV2 observed was a one-time blobstore health check on first use of a repository. Normal read/write operations use direct key-based access (Get/Put/Head).
 
-5. **Deletes are deferred with a grace period.** No S3 cost at delete time. Orphaned blobs are cleaned up by the `assetBlob.cleanup` task (grace period ~24h) followed by the `blobstore.compact` task (issues DeleteObject). S3 TTL/lifecycle rules cannot substitute for this — the compact task maintains database consistency and metrics.
+5. **Deletes are deferred with a grace period.** No S3 cost at delete time. Orphaned blobs are cleaned up by the `assetBlob.cleanup` task (grace period 60 min, runs every 30 min) followed by the `blobstore.compact` task (issues DeleteObject). Worst-case latency from delete to S3 removal is ~90 minutes. S3 TTL/lifecycle rules cannot substitute for this — the compact task maintains database consistency and metrics.
 
 6. **MinIO compatibility with Nexus 3.93.2 works** with two prerequisites:
    - `nexus.blobstore.s3.ownership.check.disabled=true` (available since 3.89.0)
