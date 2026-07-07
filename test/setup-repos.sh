@@ -92,4 +92,51 @@ nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/maven/proxy" \
     }
   }' >/dev/null 2>&1 && echo "  Created." || echo "  Already exists."
 
+# npm hosted repo
+echo "Creating npm-hosted-test repo..."
+nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/npm/hosted" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "npm-hosted-test",
+    "online": true,
+    "storage": {
+      "blobStoreName": "minio",
+      "strictContentTypeValidation": true,
+      "writePolicy": "ALLOW"
+    }
+  }' >/dev/null 2>&1 && echo "  Created." || echo "  Already exists."
+
+# PyPI hosted repo
+echo "Creating pypi-hosted-test repo..."
+nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/pypi/hosted" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "pypi-hosted-test",
+    "online": true,
+    "storage": {
+      "blobStoreName": "minio",
+      "strictContentTypeValidation": true,
+      "writePolicy": "ALLOW"
+    }
+  }' >/dev/null 2>&1 && echo "  Created." || echo "  Already exists."
+
+# Docker hosted repo
+echo "Creating docker-hosted-test repo..."
+nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/docker/hosted" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "docker-hosted-test",
+    "online": true,
+    "storage": {
+      "blobStoreName": "minio",
+      "strictContentTypeValidation": true,
+      "writePolicy": "ALLOW"
+    },
+    "docker": {
+      "v1Enabled": false,
+      "forceBasicAuth": true,
+      "httpPort": 8082
+    }
+  }' >/dev/null 2>&1 && echo "  Created." || echo "  Already exists."
+
 echo "=== Repository setup complete ==="

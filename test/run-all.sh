@@ -35,7 +35,10 @@ echo ""
 # Run scenarios
 SCENARIOS=(
   "raw-upload-download"
-  "maven-upload"
+  "maven-crud"
+  "npm-crud"
+  "pypi-crud"
+  "docker-crud"
   "proxy-cache-miss"
   "browse-search"
   "delete-compact"

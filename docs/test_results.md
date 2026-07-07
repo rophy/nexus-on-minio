@@ -2,114 +2,125 @@
 
 **Date:** 2026-07-07  
 **Nexus version:** 3.93.2 (Community Edition)  
-**MinIO image:** minio/minio:latest  
-**MinIO object count:** 0 before tests, 51 after tests
+**MinIO image:** minio/minio:latest
 
 ## Summary
 
-| Scenario | Total S3 Calls | Breakdown |
+| Scenario | Upload | Download (1st) | Download (cached) |
+|---|---|---|---|
+| Raw (1MB) | 8 | 4 | 2 |
+| Maven (jar + pom) | 11 | 5 | 1 |
+| npm (scoped package) | 14 | 5 | 1 |
+| PyPI (sdist) | 12 | 4 | 1 |
+| Docker (1 layer) | 59 | 13 | 4 |
+
+| Scenario | Total S3 Calls | Notes |
 |---|---|---|
-| Raw Upload (1MB) | 5 | 3 PutObject, 1 HeadObject, 1 GetObject |
-| Raw Download (first) | 5 | 4 GetObject, 1 PutObject |
-| Raw Re-download | 1 | 1 GetObject |
-| Maven Upload (jar + pom) | 12 | 6 PutObject, 3 GetObject, 2 HeadObject, 1 HeadBucket |
-| Proxy Cache Miss | 7 | 3 PutObject, 3 GetObject, 1 HeadObject |
+| Proxy Cache Miss | 8 | Single POM from Maven Central |
 | Proxy Cache Hit | 1 | 1 GetObject |
-| Browse Components | 0 | — |
-| Browse Assets | 0 | — |
-| Search by keyword | 0 | — |
+| Browse / Search | 0 | DB-only |
 | Delete Component | 0 | DB-only soft-delete |
-| Delete + Cleanup + Compact | 11 | See analysis below |
+| Delete + Cleanup + Compact | ~7 per blob | See analysis below |
 
-## Analysis
+## Analysis by Format
 
-### Upload (raw, 1 artifact = 5 S3 calls)
+### Raw (1MB artifact)
 
-A single 1MB raw artifact upload produces:
-- **3 PutObject** — the `.bytes` content, the `.properties` metadata, and likely a temporary blob
-- **1 HeadObject** — checking if the blob already exists
-- **1 GetObject** — reading back the `.properties` to verify/update
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Upload | 8 | 3 PutObject, 2 HeadBucket, 2 GetObject, 1 HeadObject |
+| Download (1st) | 4 | 3 GetObject, 1 PutObject |
+| Re-download | 2 | 1 GetObject, 1 HeadBucket |
 
-This confirms the **2-objects-per-blob** design. The extra calls are overhead from Nexus verifying the write.
+The 2-objects-per-blob design means each artifact creates a `.bytes` (content) and `.properties` (metadata) file. First download updates the `.properties` (last-accessed timestamp). Subsequent downloads go straight to content.
 
-### Upload (Maven, jar + pom = 12 S3 calls)
+### Maven (jar + pom = 2 files)
 
-Uploading a jar and a pom (2 logical files) produces 12 S3 calls:
-- **6 PutObject** — `.bytes` + `.properties` for each artifact, plus maven-metadata.xml updates
-- **3 GetObject** — reading back properties and existing metadata
-- **2 HeadObject** — existence checks
-- **1 HeadBucket** — bucket validation
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Upload (jar + pom) | 11 | 6 PutObject, 3 GetObject, 2 HeadObject |
+| Download (jar) | 5 | 3 GetObject, 1 PutObject, 1 HeadBucket |
+| Re-download (jar) | 1 | 1 GetObject |
+| Download (pom) | 5 | 3 GetObject, 1 PutObject, 1 HeadBucket |
 
-Roughly **5-6 S3 calls per file** uploaded, consistent with the raw upload pattern.
+~5-6 S3 calls per file uploaded. Maven also generates `maven-metadata.xml` which adds PutObject/GetObject overhead.
 
-### Download (first = 5 calls, subsequent = 1 call)
+### npm (scoped package)
 
-The first download of a raw artifact:
-- **4 GetObject** — content + properties reads (multiple, possibly due to attribute refresh)
-- **1 PutObject** — updating the `.properties` file (last-accessed timestamp or similar)
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Publish | 14 | 8 PutObject, 3 GetObject, 2 HeadObject, 1 DeleteMultipleObjects |
+| Download (tarball) | 5 | 3 GetObject, 1 PutObject, 1 HeadBucket |
+| Re-download | 1 | 1 GetObject |
 
-Subsequent downloads produce only **1 GetObject** — Nexus caches the blob location and attributes, so it goes straight to the content.
+npm publish is more expensive than raw/maven because Nexus stores the tarball, the package metadata JSON, and possibly the extracted `package.json` as separate blobs. The `DeleteMultipleObjects` during publish suggests Nexus replaces a temporary blob.
 
-### Proxy Cache Miss (7 S3 calls)
+### PyPI (sdist)
 
-Fetching a single POM file from Maven Central through a proxy repository triggers **7 S3 calls**:
-- **3 PutObject** — the cached artifact content (`.bytes`), its metadata (`.properties`), and associated upstream metadata
-- **3 GetObject** — reading back written properties and checking existing cached content
-- **1 HeadObject** — existence check
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Upload (sdist) | 12 | 6 PutObject, 3 GetObject, 2 HeadObject, 1 HeadBucket |
+| Download | 4 | 3 GetObject, 1 PutObject |
+| Re-download | 1 | 1 GetObject |
 
-This is consistent with the per-artifact overhead seen in direct uploads (~5-7 calls per blob).
+Similar to Maven. PyPI stores the tarball and metadata, generating ~6 S3 calls per file.
 
-**Note on first-ever proxy fetch:** The very first fetch from a proxy repository triggers an additional one-time **ListObjectsV2** on `content/directpath/health-check/<repo-name>`. This is a blobstore health check, not part of the cache miss flow. It does not repeat on subsequent cache misses. The test scenario performs a warmup fetch before measurement to isolate this one-time cost.
+### Docker (single-layer image)
 
-### Proxy Cache Hit (1 S3 call)
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Push (1 layer) | 59 | 24 PutObject, 25 GetObject, 6 ListObjectsV2, 4 HeadObject |
+| Pull (manifest + blobs) | 13 | 10 GetObject, 3 PutObject |
+| Re-pull | 4 | 4 GetObject |
 
-Once cached, re-fetching the same artifact produces only **1 GetObject** — Nexus serves directly from MinIO without rechecking upstream.
+Docker is the most S3-intensive format by far. A single-layer push with manifest + config + layer blob generates 59 S3 calls because:
+- Docker V2 stores each layer, config, and manifest as separate blobs
+- Each blob upload goes through a two-step process (POST to initiate, PUT to complete)
+- Nexus verifies each blob after upload and creates additional metadata
+- 6 ListObjectsV2 calls are for checking existing layers/tags in the registry
+
+Pull is also heavier because Docker serves manifest + config + layer(s) as separate requests, each requiring its own blob lookup.
+
+### Proxy Cache Miss / Hit
+
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Cache miss | 8 | 3 PutObject, 3 GetObject, 1 HeadObject, 1 HeadBucket |
+| Cache hit | 1 | 1 GetObject |
+
+Cache miss is comparable to a direct upload (~8 calls). Cache hit is a single GetObject — Nexus serves directly from MinIO without rechecking upstream.
+
+**Note on first-ever proxy fetch:** The very first fetch from a proxy repository triggers an additional one-time **ListObjectsV2** on `content/directpath/health-check/<repo-name>`. This is a blobstore health check, not part of the cache miss flow.
 
 ### Browse / Search (0 S3 calls)
 
-Browsing components, browsing assets, and keyword search produce **zero S3 calls**. These operations are served entirely from the Nexus database (H2/PostgreSQL), confirming that S3 is not on the hot path for metadata queries.
+Browsing components, browsing assets, and keyword search produce **zero S3 calls**. These operations are served entirely from the Nexus database.
 
-### Delete + Cleanup + Compact (11 S3 calls for 1 component)
+### Delete + Cleanup + Compact
 
-Deleting a component and running the full cleanup cycle produces **11 S3 calls** across three phases:
+Delete is a DB-only soft-delete (0 S3 calls). The cleanup + compact cycle costs approximately **7 S3 calls per blob** deleted:
+- **GetObject** — reading `.properties` for verification
+- **PutObject** — writing soft-delete markers
+- **DeleteMultipleObjects** — batch removal of `.bytes` + `.properties` pairs
+- **DeleteObject** — removal of soft-delete attribute copies
 
-**Phase 1 — Delete component (0 S3 calls):**
-Nexus removes the database references but leaves the S3 objects orphaned. Object count stays the same (53).
-
-**Phase 2 — assetBlob.cleanup (1 GetObject, 2 PutObject):**
-The cleanup task scans the database for orphaned blob references and moves them to `SoftDeletedBlobIndex`. It reads and writes `.properties` files marking blobs as soft-deleted. Object count increased by 1 (53→54) due to a copied soft-deleted attributes file.
-
-**Phase 3 — Compact blobstore (1 HeadBucket, 5 GetObject, 1 DeleteMultipleObjects, 1 DeleteObject):**
-The compact task reads blob IDs from `SoftDeletedBlobIndex` (database query — **no S3 LIST**), fetches `.properties` to verify deletion metadata, then batch-deletes the S3 objects:
-- **1 HeadBucket** — bucket check
-- **5 GetObject** — reading properties files for verification
-- **1 DeleteMultipleObjects** — batch removal of `.bytes` + `.properties` pairs
-- **1 DeleteObject** — removal of the soft-deleted attributes copy
-
-Objects removed: 3 (54→51), matching the uploaded artifact's `.bytes`, `.properties`, and the soft-delete attributes copy.
-
-**Key finding:** Compact does **not** use ListObjectsV2 to scan the bucket. It reads blob IDs from the `SoftDeletedBlobIndex` database table via `getRecordsBefore()`. This was confirmed by bytecode analysis of `S3BlobStore.doCompactWithDeletedBlobIndex()` and by verifying client IPs in the trace — all ListObjectsV2 calls originated from `[::1]` (the test script's `mc ls`), while Nexus calls came from `172.22.0.3`.
+Compact does **not** use ListObjectsV2 to scan the bucket. It reads blob IDs from the `SoftDeletedBlobIndex` database table via `getRecordsBefore()`. This was confirmed by bytecode analysis of `S3BlobStore.doCompactWithDeletedBlobIndex()` and by verifying client IPs in the trace.
 
 **Test configuration:** Grace period set to 0 via `nexus.assetBlobCleanupTask.blobCreatedDelayMinute=0` and cron disabled via `nexus.assetBlobCleanupTask.cronSchedule=0 0 0 31 12 ?` (Dec 31 only) to allow manual triggering.
 
-**Triggering compact programmatically:** The REST API `POST /v1/tasks` returns 405 (cannot create tasks). However:
-- The **ExtDirect API** (`POST /service/extdirect` with `coreui_Task.create`) can create a compact task with `schedule: "manual"`.
-- Existing tasks can be triggered via `POST /v1/tasks/{id}/run` (returns 204).
-- The compact task requires `notificationCondition` field (e.g., `"FAILURE"`) or creation fails.
-
-**Why S3 TTL/lifecycle rules cannot replace compact:** The compact task does more than delete S3 objects — it also cleans up `SoftDeletedBlobIndex` database records and updates blob store size/count metrics via `recordDeletion()`. External S3 lifecycle rules would bypass these steps, causing orphaned database records and corrupted usage metrics. Nexus previously had a built-in "Expiration Days" S3 lifecycle feature but **removed it in 3.80.0**, replacing it with the `blobsOlderThan` parameter on the compact task. No version since (through 3.95.0) has re-introduced S3-native TTL.
+**Why S3 TTL/lifecycle rules cannot replace compact:** The compact task also cleans up `SoftDeletedBlobIndex` database records and updates blob store size/count metrics. External S3 lifecycle rules would bypass these steps, causing orphaned database records and corrupted usage metrics. Nexus removed its built-in S3 lifecycle feature in 3.80.0. No version through 3.95.0 has re-introduced it.
 
 ## Key Takeaways
 
-1. **Nexus is not S3-chatty for reads.** After the first access, downloads are a single GetObject. Browse and search never touch S3.
+1. **Reads are cheap after first access.** Cached downloads cost 1 GetObject across all formats. Browse and search never touch S3.
 
-2. **Writes are moderately expensive.** Each artifact stored costs ~5-7 S3 calls (2 PutObject for content/properties + verification reads). This is inherent to the 2-objects-per-blob design.
+2. **Writes cost 5-14 S3 calls per artifact** depending on format. Raw and Maven are cheapest (~5-6 per file). npm and PyPI are moderate (~12-14 per package). Docker is expensive (~59 for a single-layer push) due to the multi-blob registry protocol.
 
-3. **Proxy cache misses are cheap per artifact.** A single cache miss costs ~7 S3 calls, comparable to a direct upload.
+3. **Docker is the outlier.** A single-layer Docker push generates 59 S3 calls — 5-10x more than other formats. Multi-layer images will scale linearly. Consider this when planning MinIO capacity and request rate limits.
 
-4. **No ListObjects at all during normal operations or compact.** The only ListObjectsV2 observed was a one-time blobstore health check on first use of a proxy repository. Compact reads blob IDs from the database (`SoftDeletedBlobIndex`), not from S3 — it does not scan the bucket. ListObjectsV2 would only be used during a `rebuildDeletedBlobIndex` recovery (fallback path via `doCompactWithoutDeletedBlobIndex`).
+4. **No ListObjects during normal operations or compact.** The only ListObjectsV2 observed during non-Docker operations was a one-time blobstore health check. Docker uses ListObjectsV2 during push to check existing layers. Compact reads blob IDs from the database, not S3.
 
-5. **Deletes are deferred with a grace period.** No S3 cost at delete time. The full delete-to-S3-removal cycle costs ~11 S3 calls per component (cleanup + compact). Default grace period is 60 minutes (`nexus.assetBlobCleanupTask.blobCreatedDelayMinute`), cleanup runs every 30 minutes. S3 TTL/lifecycle rules cannot substitute — compact maintains database consistency and metrics.
+5. **Deletes are deferred.** No S3 cost at delete time. The full cycle costs ~7 S3 calls per blob (cleanup + compact). Default grace period is 60 minutes.
 
 6. **MinIO compatibility with Nexus 3.93.2 works** with one prerequisite:
    - SSRF protection must be disabled or MinIO's IP allowlisted (`/v1/security/ssrf-protection`) — Nexus 3.93.2 blocks connections to private/local IPs by default

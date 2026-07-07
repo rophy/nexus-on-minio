@@ -61,16 +61,9 @@ wait_for_nexus() {
 # --- Trace capture ---
 start_trace() {
   local trace_file="$1"
-  # Kill any leftover mc processes from previous traces
-  $DC exec -T minio sh -c '
-    for p in /proc/[0-9]*/cmdline; do
-      if grep -ql "mc" "$p" 2>/dev/null; then
-        pid=$(echo "$p" | grep -o "[0-9]*")
-        kill "$pid" 2>/dev/null || true
-      fi
-    done
-  ' 2>/dev/null
-  sleep 1
+  # Restart MinIO to reset trace subsystem (killing mc corrupts it)
+  $DC restart minio >/dev/null 2>&1
+  sleep 3
   $DC exec -T minio mc alias set "$MINIO_ALIAS" http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1
   $DC exec -T minio rm -f /tmp/trace.json
   $DC exec -d minio sh -c "exec mc admin trace --call s3 --json ${MINIO_ALIAS} > /tmp/trace.json 2>/dev/null"
@@ -79,7 +72,6 @@ start_trace() {
 
 stop_trace() {
   local trace_file="$1"
-  # kill mc processes inside the container (no pidof/pkill available)
   $DC exec -T minio sh -c '
     for p in /proc/[0-9]*/cmdline; do
       if grep -ql "mc" "$p" 2>/dev/null; then
@@ -125,7 +117,7 @@ summarize_trace() {
     | sort -t'|' -k3 -rn
   echo ""
   local total
-  total=$(jq -r '[.[] | select(.api != null and .client != "[::1]")] | length' "$trace_file" 2>/dev/null || echo 0)
+  total=$(jq -s '[.[] | select(.api != null and .client != "[::1]")] | length' "$trace_file" 2>/dev/null || echo 0)
   echo "**Total S3 calls: ${total}**"
   echo ""
 }

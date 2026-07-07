@@ -79,12 +79,8 @@ if [ -z "$COMPACT_TASK_ID" ]; then
   exit 1
 fi
 
-# Restart MinIO to ensure mc admin trace works cleanly.
-# Killing mc processes in earlier scenarios can corrupt MinIO's trace subsystem.
-$DC restart minio
-sleep 5
-
 # --- Use a single long-lived trace for all three phases ---
+# start_trace restarts MinIO to reset trace subsystem
 start_trace "${TRACE_DIR}/all-phases.json"
 
 # --- Phase 1: Delete component (soft-delete, DB only) ---
