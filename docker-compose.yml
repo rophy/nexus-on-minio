@@ -28,6 +28,14 @@ services:
       INSTALL4J_ADD_VM_PARAMS: >-
         -Xms512m -Xmx1200m
         -Dnexus.blobstore.s3.ownership.check.disabled=true
+        -Dnexus.assetBlobCleanupTask.blobCreatedDelayMinute=0
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /nexus-data/etc
+        echo 'nexus.assetBlobCleanupTask.cronSchedule=0 0 0 31 12 ?' >> /nexus-data/etc/nexus.properties
+        exec /opt/sonatype/nexus/bin/nexus run
     volumes:
       - nexus-data:/nexus-data
 

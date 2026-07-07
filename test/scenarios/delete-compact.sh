@@ -39,19 +39,20 @@ if [ -z "$COMPONENT_ID" ]; then
   exit 1
 fi
 
-echo "Deleting component ${COMPONENT_ID}..."
-start_trace "${TRACE_DIR}/delete.json"
+# Count objects before delete
+BEFORE_DELETE=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
+echo "Objects before delete: ${BEFORE_DELETE}"
 
-nexus_curl -X DELETE "${NEXUS_URL}/service/rest/v1/components/${COMPONENT_ID}" >/dev/null
+# Find the raw cleanup task ID (needed for phase 2)
+RAW_CLEANUP_ID=$(nexus_curl "${NEXUS_URL}/service/rest/v1/tasks" 2>/dev/null \
+  | jq -r '.items[] | select(.name | contains("raw")) | select(.type == "assetBlob.cleanup") | .id')
 
-# Give Nexus a moment to process the soft-delete
-sleep 3
+if [ -z "$RAW_CLEANUP_ID" ]; then
+  echo "ERROR: Could not find raw assetBlob.cleanup task" >&2
+  exit 1
+fi
 
-stop_trace "${TRACE_DIR}/delete.json"
-summarize_trace "${TRACE_DIR}/delete.json" "Delete Component" | tee "${TRACE_DIR}/delete.md"
-
-# Create the compact task via ExtDirect API (REST API POST /v1/tasks returns 405)
-echo "Creating compact blobstore task via ExtDirect API..."
+# Create compact task upfront (needed for phase 3)
 COMPACT_RESULT=$(curl -sf -u "${NEXUS_USER}:${NEXUS_PASS}" -X POST "${NEXUS_URL}/service/extdirect" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -77,39 +78,60 @@ if [ -z "$COMPACT_TASK_ID" ]; then
   echo "$COMPACT_RESULT" | jq .
   exit 1
 fi
-echo "  Created compact task: ${COMPACT_TASK_ID}"
 
-# Count objects before compact
-BEFORE_COUNT=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
-echo "  Objects before compact: ${BEFORE_COUNT}"
+# Restart MinIO to ensure mc admin trace works cleanly.
+# Killing mc processes in earlier scenarios can corrupt MinIO's trace subsystem.
+$DC restart minio
+sleep 5
 
-# Run the compact task with trace
-echo "Running compact task..."
-start_trace "${TRACE_DIR}/compact.json"
+# --- Use a single long-lived trace for all three phases ---
+start_trace "${TRACE_DIR}/all-phases.json"
 
+# --- Phase 1: Delete component (soft-delete, DB only) ---
+echo "Phase 1: Deleting component ${COMPONENT_ID}..."
+nexus_curl -X DELETE "${NEXUS_URL}/service/rest/v1/components/${COMPONENT_ID}" >/dev/null
+sleep 3
+
+AFTER_DELETE=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
+echo "Objects after delete: ${AFTER_DELETE} (expected: same as before)"
+
+# --- Phase 2: Run assetBlob.cleanup to move orphans to SoftDeletedBlobIndex ---
+# Grace period is set to 0 via nexus.assetBlobCleanupTask.blobCreatedDelayMinute=0
+echo ""
+echo "Phase 2: Running assetBlob.cleanup task..."
+nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/tasks/${RAW_CLEANUP_ID}/run" >/dev/null
+
+for i in $(seq 1 30); do
+  STATE=$(nexus_curl "${NEXUS_URL}/service/rest/v1/tasks/${RAW_CLEANUP_ID}" 2>/dev/null \
+    | jq -r '.currentState // "UNKNOWN"')
+  [ "$STATE" = "WAITING" ] && break
+  sleep 1
+done
+sleep 2
+
+AFTER_CLEANUP=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
+echo "Objects after cleanup: ${AFTER_CLEANUP}"
+
+# --- Phase 3: Run compact to hard-delete from S3 ---
+echo ""
+echo "Phase 3: Running compact task..."
 nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/tasks/${COMPACT_TASK_ID}/run" >/dev/null
 
-# Wait for task to complete
 for i in $(seq 1 30); do
   STATE=$(nexus_curl "${NEXUS_URL}/service/rest/v1/tasks/${COMPACT_TASK_ID}" 2>/dev/null \
     | jq -r '.currentState // "UNKNOWN"')
   [ "$STATE" = "WAITING" ] && break
   sleep 1
 done
+sleep 3
 
-stop_trace "${TRACE_DIR}/compact.json"
-summarize_trace "${TRACE_DIR}/compact.json" "Compact Blobstore" | tee "${TRACE_DIR}/compact.md"
+AFTER_COMPACT=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
 
-# Count objects after compact
-AFTER_COUNT=$($DC exec -T minio mc ls --recursive local/nexus-blobstore/ 2>/dev/null | wc -l)
-echo "  Objects after compact: ${AFTER_COUNT}"
-echo "  Objects removed: $((BEFORE_COUNT - AFTER_COUNT))"
-echo ""
-echo "NOTE: Compact may report 0 objects removed because the assetBlob.cleanup"
-echo "      task has a grace period (default 60 min) before orphaned blobs become"
-echo "      eligible for compaction. The two-stage process is:"
-echo "      1. assetBlob.cleanup (cron) -> moves orphaned blobs to SoftDeletedBlobIndex"
-echo "      2. blobstore.compact (manual) -> issues S3 DeleteObject for indexed blobs"
+stop_trace "${TRACE_DIR}/all-phases.json"
+summarize_trace "${TRACE_DIR}/all-phases.json" "Delete + Cleanup + Compact (all phases)" | tee "${TRACE_DIR}/all-phases.md"
+
+echo "Objects after compact: ${AFTER_COMPACT}"
+echo "Objects removed by compact: $((AFTER_CLEANUP - AFTER_COMPACT))"
 
 # Clean up the test task
 curl -sf -u "${NEXUS_USER}:${NEXUS_PASS}" -X POST "${NEXUS_URL}/service/extdirect" \
@@ -122,4 +144,6 @@ curl -sf -u "${NEXUS_USER}:${NEXUS_PASS}" -X POST "${NEXUS_URL}/service/extdirec
     \"tid\": 2
   }" >/dev/null 2>&1 || true
 
+echo ""
+echo "Summary: before=${BEFORE_DELETE} afterDelete=${AFTER_DELETE} afterCleanup=${AFTER_CLEANUP} afterCompact=${AFTER_COMPACT}"
 echo "=== Scenario complete ==="
