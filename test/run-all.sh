@@ -38,7 +38,7 @@ SCENARIOS=(
   "maven-crud"
   "npm-crud"
   "pypi-crud"
-  "docker-crud"
+  "helm-crud"
   "proxy-cache-miss"
   "browse-search"
   "delete-compact"

@@ -120,7 +120,7 @@ nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/pypi/hosted" \
     }
   }' >/dev/null 2>&1 && echo "  Created." || echo "  Already exists."
 
-# Docker hosted repo
+# Docker hosted repo (used for Helm OCI charts)
 echo "Creating docker-hosted-test repo..."
 nexus_curl -X POST "${NEXUS_URL}/service/rest/v1/repositories/docker/hosted" \
   -H 'Content-Type: application/json' \

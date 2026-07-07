@@ -12,7 +12,7 @@
 | Maven (jar + pom) | 11 | 5 | 1 |
 | npm (scoped package) | 14 | 5 | 1 |
 | PyPI (sdist) | 12 | 4 | 1 |
-| Docker (1 layer) | 59 | 13 | 4 |
+| Helm (OCI, 1 chart) | 59 | 14 | 4 |
 
 | Scenario | Total S3 Calls | Notes |
 |---|---|---|
@@ -65,21 +65,20 @@ npm publish is more expensive than raw/maven because Nexus stores the tarball, t
 
 Similar to Maven. PyPI stores the tarball and metadata, generating ~6 S3 calls per file.
 
-### Docker (single-layer image)
+### Helm (OCI chart)
 
 | Operation | Calls | Breakdown |
 |---|---|---|
-| Push (1 layer) | 59 | 24 PutObject, 25 GetObject, 6 ListObjectsV2, 4 HeadObject |
-| Pull (manifest + blobs) | 13 | 10 GetObject, 3 PutObject |
+| Push (1 chart) | 59 | 24 PutObject, 25 GetObject, 6 ListObjectsV2, 4 HeadObject |
+| Pull (manifest + blobs) | 14 | 10 GetObject, 3 PutObject, 1 HeadBucket |
 | Re-pull | 4 | 4 GetObject |
 
-Docker is the most S3-intensive format by far. A single-layer push with manifest + config + layer blob generates 59 S3 calls because:
-- Docker V2 stores each layer, config, and manifest as separate blobs
-- Each blob upload goes through a two-step process (POST to initiate, PUT to complete)
-- Nexus verifies each blob after upload and creates additional metadata
-- 6 ListObjectsV2 calls are for checking existing layers/tags in the registry
+Helm OCI charts use the Docker V2 registry API with Helm-specific media types:
+- Config: `application/vnd.cncf.helm.config.v1+json` (chart metadata)
+- Layer: `application/vnd.cncf.helm.chart.content.v1.tar.gz` (chart tarball)
+- Manifest: `application/vnd.oci.image.manifest.v1+json`
 
-Pull is also heavier because Docker serves manifest + config + layer(s) as separate requests, each requiring its own blob lookup.
+The S3 call count matches Docker images exactly (59 push / 14 pull / 4 re-pull) because both go through the same Nexus Docker registry code path. The blob upload two-step process (POST initiate, PUT complete), manifest storage (by tag and by digest), and layer verification are identical regardless of media type.
 
 ### Proxy Cache Miss / Hit
 
@@ -114,11 +113,11 @@ Compact does **not** use ListObjectsV2 to scan the bucket. It reads blob IDs fro
 
 1. **Reads are cheap after first access.** Cached downloads cost 1 GetObject across all formats. Browse and search never touch S3.
 
-2. **Writes cost 5-14 S3 calls per artifact** depending on format. Raw and Maven are cheapest (~5-6 per file). npm and PyPI are moderate (~12-14 per package). Docker is expensive (~59 for a single-layer push) due to the multi-blob registry protocol.
+2. **Writes cost 5-14 S3 calls per artifact** depending on format. Raw and Maven are cheapest (~5-6 per file). npm and PyPI are moderate (~12-14 per package). OCI-based formats (Helm charts) are more expensive due to the multi-blob registry protocol.
 
-3. **Docker is the outlier.** A single-layer Docker push generates 59 S3 calls — 5-10x more than other formats. Multi-layer images will scale linearly. Consider this when planning MinIO capacity and request rate limits.
+3. **OCI registry formats are heavier.** Helm OCI charts use the Docker V2 registry API, which stores config, layers, and manifests as separate blobs — each requiring its own upload/verification cycle. Multi-layer artifacts scale linearly.
 
-4. **No ListObjects during normal operations or compact.** The only ListObjectsV2 observed during non-Docker operations was a one-time blobstore health check. Docker uses ListObjectsV2 during push to check existing layers. Compact reads blob IDs from the database, not S3.
+4. **No ListObjects during normal operations or compact.** The only ListObjectsV2 observed during non-OCI operations was a one-time blobstore health check. OCI pushes may use ListObjectsV2 to check existing layers/tags. Compact reads blob IDs from the database, not S3.
 
 5. **Deletes are deferred.** No S3 cost at delete time. The full cycle costs ~7 S3 calls per blob (cleanup + compact). Default grace period is 60 minutes.
 
