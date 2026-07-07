@@ -111,6 +111,7 @@ Objects removed: 3 (54→51), matching the uploaded artifact's `.bytes`, `.prope
 
 5. **Deletes are deferred with a grace period.** No S3 cost at delete time. The full delete-to-S3-removal cycle costs ~11 S3 calls per component (cleanup + compact). Default grace period is 60 minutes (`nexus.assetBlobCleanupTask.blobCreatedDelayMinute`), cleanup runs every 30 minutes. S3 TTL/lifecycle rules cannot substitute — compact maintains database consistency and metrics.
 
-6. **MinIO compatibility with Nexus 3.93.2 works** with two prerequisites:
-   - `nexus.blobstore.s3.ownership.check.disabled=true` (available since 3.89.0)
+6. **MinIO compatibility with Nexus 3.93.2 works** with one prerequisite:
+   - SSRF protection must be disabled or MinIO's IP allowlisted (`/v1/security/ssrf-protection`) — Nexus 3.93.2 blocks connections to private/local IPs by default
    - EULA acceptance via REST API before any repository operations
+   - `nexus.blobstore.s3.ownership.check.disabled=true` is **NOT required** — [sonatype/nexus-public#200](https://github.com/sonatype/nexus-public/issues/200) reported that MinIO failed the ownership check because Nexus used `GetBucketAcl`, which MinIO doesn't support. The fix in 3.89.0 ([commit 51396c2](https://github.com/sonatype/nexus-public/commit/51396c2d32d3704a8c94b477a633ed8553c510cf)) changed the check from `GetBucketAcl` to `GetBucketPolicy` and added the disable flag as an extra escape hatch. Since MinIO supports `GetBucketPolicy` (returning `NoSuchBucketPolicy` when no policy is set, which Nexus treats as "ownership confirmed"), the flag is unnecessary on 3.89.0+
