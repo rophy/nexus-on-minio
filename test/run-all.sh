@@ -38,6 +38,7 @@ SCENARIOS=(
   "maven-crud"
   "npm-crud"
   "pypi-crud"
+  "cargo-crud"
   "helm-crud"
   "proxy-cache-miss"
   "browse-search"

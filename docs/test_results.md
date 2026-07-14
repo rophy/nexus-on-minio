@@ -12,6 +12,7 @@
 | Maven (jar + pom) | 11 | 5 | 1 |
 | npm (scoped package) | 14 | 5 | 1 |
 | PyPI (sdist) | 12 | 4 | 1 |
+| Cargo (crate) | 13 | 4 | 2 |
 | Helm (OCI, 1 chart) | 59 | 14 | 4 |
 
 | Scenario | Total S3 Calls | Notes |
@@ -65,6 +66,16 @@ npm publish is more expensive than raw/maven because Nexus stores the tarball, t
 
 Similar to Maven. PyPI stores the tarball and metadata, generating ~6 S3 calls per file.
 
+### Cargo (crate)
+
+| Operation | Calls | Breakdown |
+|---|---|---|
+| Publish | 13 | 6 PutObject, 4 GetObject, 2 HeadObject, 1 HeadBucket |
+| Download | 4 | 3 GetObject, 1 PutObject |
+| Re-download | 2 | 1 GetObject, 1 HeadBucket |
+
+Similar to PyPI — Nexus stores the `.crate` tarball and a sparse index entry (`/te/st/test-crate`) as separate blobs. The publish payload uses Cargo's wire format (u32le length-prefixed JSON metadata + crate bytes), which Nexus parses server-side.
+
 ### Helm (OCI chart)
 
 | Operation | Calls | Breakdown |
@@ -113,7 +124,7 @@ Compact does **not** use ListObjectsV2 to scan the bucket. It reads blob IDs fro
 
 1. **Reads are cheap after first access.** Cached downloads cost 1 GetObject across all formats. Browse and search never touch S3.
 
-2. **Writes cost 5-14 S3 calls per artifact** depending on format. Raw and Maven are cheapest (~5-6 per file). npm and PyPI are moderate (~12-14 per package). OCI-based formats (Helm charts) are more expensive due to the multi-blob registry protocol.
+2. **Writes cost 5-14 S3 calls per artifact** depending on format. Raw and Maven are cheapest (~5-6 per file). npm, PyPI, and Cargo are moderate (~11-14 per package). OCI-based formats (Helm charts) are much more expensive due to the multi-blob registry protocol.
 
 3. **OCI registry formats are heavier.** Helm OCI charts use the Docker V2 registry API, which stores config, layers, and manifests as separate blobs — each requiring its own upload/verification cycle. Multi-layer artifacts scale linearly.
 
